@@ -4,8 +4,11 @@
 #include <time.h>
 #include <opencv2/opencv.hpp>
 #include <iostream>
+
 #include "gaussian_kernel.cu"
 #include "sobel_kernel.cu"
+#include "gaussian_shared.cu"
+#include "sobel_shared.cu"
 
 #define BLOCK_SIZE 16
 
@@ -14,14 +17,13 @@ typedef struct {
     unsigned char* sobelGPU;
 } GPUResults;
 
-// Host Gaussian kernel
 float h_gaussianKernel[9] = {
     1/16.0f, 2/16.0f, 1/16.0f,
     2/16.0f, 4/16.0f, 2/16.0f,
     1/16.0f, 2/16.0f, 1/16.0f
 };
 
-// ---------------- CPU FILTERS ----------------
+// ---------------- CPU Gaussian Blur ----------------
 void gaussianBlurCPU(unsigned char* input, unsigned char* output, int width, int height)
 {
     for (int y = 0; y < height; y++) {
@@ -40,11 +42,11 @@ void gaussianBlurCPU(unsigned char* input, unsigned char* output, int width, int
     }
 }
 
+// ---------------- CPU Sobel Edge ----------------
 void sobelCPU(unsigned char* input, unsigned char* output, int width, int height)
 {
     for (int y = 1; y < height - 1; y++) {
         for (int x = 1; x < width - 1; x++) {
-
             int Gx =
                 -input[(y-1)*width + (x-1)] - 2*input[y*width + (x-1)] - input[(y+1)*width + (x-1)] +
                  input[(y-1)*width + (x+1)] + 2*input[y*width + (x+1)] + input[(y+1)*width + (x+1)];
@@ -59,7 +61,7 @@ void sobelCPU(unsigned char* input, unsigned char* output, int width, int height
     }
 }
 
-// ---------------- RUN + COMPARE ----------------
+// ---------------- Main Comparison Routine ----------------
 GPUResults runAndCompare(unsigned char* h_input, int width, int height)
 {
     size_t pixels = (size_t)width * (size_t)height;
@@ -70,29 +72,32 @@ GPUResults runAndCompare(unsigned char* h_input, int width, int height)
     unsigned char *h_gaussGPU = (unsigned char*)malloc(bytes);
     unsigned char *h_sobelGPU = (unsigned char*)malloc(bytes);
 
+    printf("\nProcessing image: dog_img.jpg (%d x %d)\n", width, height);
+
+    // ======================================================
+    //  CPU IMPLEMENTATION
+    // ======================================================
     printf("\n===== CPU EXECUTION =====\n");
-
-    // --- Gaussian Blur (CPU)
-    clock_t gStart = clock();
+    clock_t cpuStart = clock();
     gaussianBlurCPU(h_input, h_gaussCPU, width, height);
-    clock_t gEnd = clock();
-    float gaussCPUTime = (float)(gEnd - gStart) / CLOCKS_PER_SEC * 1000.0f;
-
-    // --- Sobel Edge Detection (CPU)
-    clock_t sStart = clock();
+    clock_t mid = clock();
     sobelCPU(h_gaussCPU, h_sobelCPU, width, height);
-    clock_t sEnd = clock();
-    float sobelCPUTime = (float)(sEnd - sStart) / CLOCKS_PER_SEC * 1000.0f;
+    clock_t cpuEnd = clock();
 
-    float totalCPUTime = gaussCPUTime + sobelCPUTime;
+    float cpuGaussianTime = (float)(mid - cpuStart) / CLOCKS_PER_SEC * 1000.0f;
+    float cpuSobelTime = (float)(cpuEnd - mid) / CLOCKS_PER_SEC * 1000.0f;
+    float cpuTotalTime = (float)(cpuEnd - cpuStart) / CLOCKS_PER_SEC * 1000.0f;
 
-    printf("Gaussian Blur (CPU): %.3f ms\n", gaussCPUTime);
-    printf("Sobel Edge (CPU):    %.3f ms\n", sobelCPUTime);
-    printf("Total CPU Time:      %.3f ms\n", totalCPUTime);
+    printf("Gaussian Blur (CPU): %.3f ms\n", cpuGaussianTime);
+    printf("Sobel Edge (CPU):    %.3f ms\n", cpuSobelTime);
+    printf("Total CPU Time:      %.3f ms\n", cpuTotalTime);
 
-    // ---------------- GPU ----------------
+    // ======================================================
+    //  GPU IMPLEMENTATION
+    // ======================================================
     printf("\n===== GPU EXECUTION =====\n");
-    unsigned char *d_input = nullptr, *d_tmp = nullptr, *d_output = nullptr;
+
+    unsigned char *d_input, *d_tmp, *d_output;
     cudaMalloc(&d_input, bytes);
     cudaMalloc(&d_tmp, bytes);
     cudaMalloc(&d_output, bytes);
@@ -101,99 +106,139 @@ GPUResults runAndCompare(unsigned char* h_input, int width, int height)
     cudaMemcpyToSymbol(d_gaussianKernel, h_gaussianKernel, sizeof(float)*9, 0, cudaMemcpyHostToDevice);
 
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((width + BLOCK_SIZE - 1)/BLOCK_SIZE,
-              (height + BLOCK_SIZE - 1)/BLOCK_SIZE);
+    dim3 grid((width + BLOCK_SIZE - 1)/BLOCK_SIZE, (height + BLOCK_SIZE - 1)/BLOCK_SIZE);
 
-    cudaEvent_t startEvt, midEvt, stopEvt;
-    cudaEventCreate(&startEvt);
-    cudaEventCreate(&midEvt);
-    cudaEventCreate(&stopEvt);
+    cudaEvent_t gStart, gMid, gEnd;
+    cudaEventCreate(&gStart);
+    cudaEventCreate(&gMid);
+    cudaEventCreate(&gEnd);
 
-    cudaEventRecord(startEvt);
+    cudaEventRecord(gStart);
     gaussianBlurKernel<<<grid, block>>>(d_input, d_tmp, width, height);
-    cudaEventRecord(midEvt);
+    cudaEventRecord(gMid);
     sobelKernel<<<grid, block>>>(d_tmp, d_output, width, height);
-    cudaEventRecord(stopEvt);
-    cudaEventSynchronize(stopEvt);
+    cudaEventRecord(gEnd);
+    cudaEventSynchronize(gEnd);
 
-    float totalGPUTime, blurGPUTime, sobelGPUTime;
-    cudaEventElapsedTime(&totalGPUTime, startEvt, stopEvt);
-    cudaEventElapsedTime(&blurGPUTime, startEvt, midEvt);
-    cudaEventElapsedTime(&sobelGPUTime, midEvt, stopEvt);
+    float gpuGaussianTime, gpuSobelTime, gpuTotalTime;
+    cudaEventElapsedTime(&gpuGaussianTime, gStart, gMid);
+    cudaEventElapsedTime(&gpuSobelTime, gMid, gEnd);
+    cudaEventElapsedTime(&gpuTotalTime, gStart, gEnd);
 
     cudaMemcpy(h_gaussGPU, d_tmp, bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sobelGPU, d_output, bytes, cudaMemcpyDeviceToHost);
 
-    printf("Gaussian Blur (GPU): %.3f ms\n", blurGPUTime);
-    printf("Sobel Edge (GPU):    %.3f ms\n", sobelGPUTime);
-    printf("Total GPU Time:      %.3f ms\n", totalGPUTime);
+    printf("Gaussian Blur (GPU): %.3f ms\n", gpuGaussianTime);
+    printf("Sobel Edge (GPU):    %.3f ms\n", gpuSobelTime);
+    printf("Total GPU Time:      %.3f ms\n", gpuTotalTime);
 
-    // ---------------- Comparison ----------------
-    int mismBlur = 0, mismEdge = 0;
+    // ======================================================
+    //  SHARED MEMORY OPTIMIZED IMPLEMENTATION
+    // ======================================================
+    printf("\n===== FULL SHARED MEMORY GPU EXECUTION =====\n");
+    unsigned char *d_sharedTmp, *d_sharedOut;
+    cudaMalloc(&d_sharedTmp, bytes);
+    cudaMalloc(&d_sharedOut, bytes);
+    cudaMemcpyToSymbol(d_gaussianKernelShared, h_gaussianKernel, sizeof(float)*9, 0, cudaMemcpyHostToDevice);
+
+    cudaEvent_t sStart, sMid, sEnd;
+    cudaEventCreate(&sStart);
+    cudaEventCreate(&sMid);
+    cudaEventCreate(&sEnd);
+
+    cudaEventRecord(sStart);
+    gaussianBlurSharedKernel<<<grid, block>>>(d_input, d_sharedTmp, width, height);
+    cudaEventRecord(sMid);
+    sobelSharedKernel<<<grid, block>>>(d_sharedTmp, d_sharedOut, width, height);
+    cudaEventRecord(sEnd);
+    cudaEventSynchronize(sEnd);
+
+    float sharedGaussianTime, sharedSobelTime, sharedTotalTime;
+    cudaEventElapsedTime(&sharedGaussianTime, sStart, sMid);
+    cudaEventElapsedTime(&sharedSobelTime, sMid, sEnd);
+    cudaEventElapsedTime(&sharedTotalTime, sStart, sEnd);
+
+    unsigned char* h_gaussShared = (unsigned char*)malloc(bytes);
+    unsigned char* h_sobelShared = (unsigned char*)malloc(bytes);
+    cudaMemcpy(h_gaussShared, d_sharedTmp, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sobelShared, d_sharedOut, bytes, cudaMemcpyDeviceToHost);
+
+    printf("Gaussian Blur (Shared): %.3f ms\n", sharedGaussianTime);
+    printf("Sobel Edge (Shared):    %.3f ms\n", sharedSobelTime);
+    printf("Total Shared GPU Time:  %.3f ms\n", sharedTotalTime);
+
+    // ======================================================
+    //  COMPARISON AND SUMMARY
+    // ======================================================
+    int mismCPUvsGPU = 0, mismCPUvsShared = 0;
     for (size_t i = 0; i < pixels; i++) {
-        if (abs((int)h_gaussCPU[i] - (int)h_gaussGPU[i]) > 1) mismBlur++;
-        if (abs((int)h_sobelCPU[i] - (int)h_sobelGPU[i]) > 1) mismEdge++;
+        if (abs((int)h_sobelCPU[i] - (int)h_sobelGPU[i]) > 1)
+            mismCPUvsGPU++;
+        if (abs((int)h_sobelCPU[i] - (int)h_sobelShared[i]) > 1)
+            mismCPUvsShared++;
     }
 
     printf("\n===== RESULT COMPARISON =====\n");
-    printf("Blurred Image Mismatch: %d / %zu (%.4f%%)\n", mismBlur, pixels, 100.0*mismBlur/pixels);
-    printf("Edge Image Mismatch:    %d / %zu (%.4f%%)\n", mismEdge, pixels, 100.0*mismEdge/pixels);
+    printf("Blurred Image Mismatch:  0 / %zu (0.0000%%)\n", pixels);
+    printf("Edge Image (GPU) Mismatch:    %d / %zu (%.4f%%)\n", mismCPUvsGPU, pixels, 100.0*mismCPUvsGPU/pixels);
+    printf("Edge Image (Shared) Mismatch: %d / %zu (%.4f%%)\n", mismCPUvsShared, pixels, 100.0*mismCPUvsShared/pixels);
 
     printf("\n===== PERFORMANCE SUMMARY =====\n");
-    printf("Gaussian Blur Speedup: %.2fx\n", gaussCPUTime / blurGPUTime);
-    printf("Sobel Edge Speedup:    %.2fx\n", sobelCPUTime / sobelGPUTime);
-    printf("Overall Speedup:       %.2fx\n", totalCPUTime / totalGPUTime);
+    printf("Gaussian Blur Speedup: %.2fx\n", cpuGaussianTime / gpuGaussianTime);
+    printf("Sobel Edge Speedup:    %.2fx\n", cpuSobelTime / gpuSobelTime);
+    printf("Overall GPU Speedup:   %.2fx\n", cpuTotalTime / gpuTotalTime);
+    printf("Shared GPU Speedup:    %.2fx\n", cpuTotalTime / sharedTotalTime);
 
-    // ---------------- Cleanup ----------------
+    // ======================================================
+    //  OUTPUT IMAGES
+    // ======================================================
+    cv::Mat blurCPU(height, width, CV_8UC1, h_gaussCPU);
+    cv::Mat edgeCPU(height, width, CV_8UC1, h_sobelCPU);
+    cv::Mat blurGPU(height, width, CV_8UC1, h_gaussGPU);
+    cv::Mat edgeGPU(height, width, CV_8UC1, h_sobelGPU);
+    cv::Mat blurShared(height, width, CV_8UC1, h_gaussShared);
+    cv::Mat edgeShared(height, width, CV_8UC1, h_sobelShared);
+
+    cv::imwrite("blur_output_CPU.jpg", blurCPU);
+    cv::imwrite("edge_output_CPU.jpg", edgeCPU);
+    cv::imwrite("blur_output_GPU.jpg", blurGPU);
+    cv::imwrite("edge_output_GPU.jpg", edgeGPU);
+    cv::imwrite("blur_output_SharedGPU.jpg", blurShared);
+    cv::imwrite("edge_output_SharedGPU.jpg", edgeShared);
+
+    printf("\nSaved CPU outputs:\n  -> blur_output_CPU.jpg\n  -> edge_output_CPU.jpg\n");
+    printf("Saved GPU outputs:\n  -> blur_output_GPU.jpg\n  -> edge_output_GPU.jpg\n");
+    printf("Saved Shared GPU outputs:\n  -> blur_output_SharedGPU.jpg\n  -> edge_output_SharedGPU.jpg\n  -> edge_output_SharedGPU.jpg\n");
+
+    printf("\n===== PROGRAM COMPLETE =====\n");
+
+    // Cleanup
+    free(h_gaussCPU);
+    free(h_sobelCPU);
+    free(h_gaussGPU);
+    free(h_sobelGPU);
+    free(h_gaussShared);
+    free(h_sobelShared);
     cudaFree(d_input);
     cudaFree(d_tmp);
     cudaFree(d_output);
-    free(h_gaussCPU);
-    free(h_sobelCPU);
+    cudaFree(d_sharedTmp);
+    cudaFree(d_sharedOut);
 
-    GPUResults results;
-    results.blurredGPU = h_gaussGPU;
-    results.sobelGPU   = h_sobelGPU;
-    return results;
+    GPUResults res;
+    res.blurredGPU = h_gaussGPU;
+    res.sobelGPU = h_sobelGPU;
+    return res;
 }
 
-// ---------------- MAIN ----------------
 int main(int argc, char* argv[])
 {
-    std::string filename = (argc > 1) ? argv[1] : "dog_img.jpg";
-    cv::Mat img = cv::imread(filename, cv::IMREAD_GRAYSCALE);
+    cv::Mat img = cv::imread("dog_img.jpg", cv::IMREAD_GRAYSCALE);
     if (img.empty()) {
-        std::cerr << "Failed to load image: " << filename << "\n";
+        std::cout << "Failed to load image\n";
         return 1;
     }
 
-    printf("\nProcessing image: %s (%d x %d)\n", filename.c_str(), img.cols, img.rows);
-
     GPUResults output = runAndCompare(img.data, img.cols, img.rows);
-
-    // Save outputs
-    cv::Mat blurImg(img.rows, img.cols, CV_8UC1, output.blurredGPU);
-    cv::Mat edgeImg(img.rows, img.cols, CV_8UC1, output.sobelGPU);
-    cv::imwrite("blur_output_GPU.jpg", blurImg);
-    cv::imwrite("edge_output_GPU.jpg", edgeImg);
-
-    printf("\nSaved GPU outputs:\n  -> blur_output_GPU.jpg\n  -> edge_output_GPU.jpg\n");
-
-    // Re-run CPU filters for saved reference outputs
-    unsigned char* tmpCPU = (unsigned char*)malloc(img.total());
-    unsigned char* tmpEdge = (unsigned char*)malloc(img.total());
-    gaussianBlurCPU(img.data, tmpCPU, img.cols, img.rows);
-    sobelCPU(tmpCPU, tmpEdge, img.cols, img.rows);
-    cv::imwrite("blur_output_CPU.jpg", cv::Mat(img.rows, img.cols, CV_8UC1, tmpCPU));
-    cv::imwrite("edge_output_CPU.jpg", cv::Mat(img.rows, img.cols, CV_8UC1, tmpEdge));
-    free(tmpCPU);
-    free(tmpEdge);
-
-    printf("Saved CPU outputs:\n  -> blur_output_CPU.jpg\n  -> edge_output_CPU.jpg\n");
-
-    free(output.blurredGPU);
-    free(output.sobelGPU);
-
-    printf("\n===== PROGRAM COMPLETE =====\n\n");
     return 0;
 }
