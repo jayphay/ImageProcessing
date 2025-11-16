@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+
 void writePGM(const char* filename, unsigned char* data, int width, int height)
 {
     FILE* f = fopen(filename, "wb");

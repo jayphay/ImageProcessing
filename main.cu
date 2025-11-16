@@ -6,8 +6,6 @@
 #include <iostream>
 #include "gaussian_kernel.cu"
 #include "sobel_kernel.cu"
-#include "readPgm.c"
-#include "writePgm.c"
 
 #define BLOCK_SIZE 16
 
